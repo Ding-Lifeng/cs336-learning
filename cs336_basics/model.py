@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 from torch import Tensor
-from einops import einsum
+from einops import einsum, rearrange
 
 # 线性变换 - 矩阵乘法
 class Linear(nn.Module):
@@ -208,3 +208,162 @@ class RoPE(nn.Module):
         # 交错合并
         output = torch.stack([input_rot_even, input_rot_odd], dim=-1)
         return output.flatten(-2)
+    
+from cs336_basics.nn_utils import scaled_dot_product_attention
+
+# 多头自注意力机制
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self,
+        d_model: int,
+        num_heads: int,
+        rope = None,
+        device = None,
+        dtype = None
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        
+        # d_model必须是num_heads的整数倍
+        assert d_model % num_heads == 0
+
+        self.d_head = d_model // num_heads
+
+        # Linear 投影
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+
+        # RoPE 模块
+        self.rope = rope
+
+    def forward(
+        self, 
+        in_features: Float[Tensor, " ... sequence_length d_model"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None
+        ) -> Float[Tensor, " ... sequence_length d_model"]:
+            # 计算Q/K/V
+            Q = self.q_proj(in_features)
+            K = self.k_proj(in_features)
+            V = self.v_proj(in_features)
+
+            # 分割多头(..., seq_len, d_model) -> (..., num_heads, seq_len, d_model) - 分割特征维度
+            Q = rearrange(Q, "... seq (head d_head) -> ... head seq d_head", head=self.num_heads)
+            K = rearrange(K, "... seq (head d_head) -> ... head seq d_head", head=self.num_heads)
+            V = rearrange(V, "... seq (head d_head) -> ... head seq d_head", head=self.num_heads)
+            
+            # RoPE 可选
+            if self.rope is not None and token_positions is not None:
+                Q = self.rope(Q, token_positions)
+                K = self.rope(K, token_positions)
+
+            # causal mask 训练阶段防止模型使用未来token作弊
+            seq_len = in_features.size(-2)
+            mask = torch.tril(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=in_features.device)
+            )
+
+            # attention
+            attn = scaled_dot_product_attention(Q, K, V, mask)
+
+            # 合并
+            attn = rearrange(attn, "... head seq d_head -> ... seq (head d_head)")
+
+            # 输出投影
+            return self.o_proj(attn)
+    
+# TransformerBlock
+# in_features -> RMSNorm -> MultiHeadSelfAttention(RoPE) -> residual -> RMSNorm -> SwiGLU -> residual -> output
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+
+        # 第一层 RMSNorm
+        self.ln1 = Rmsnorm(d_model=d_model, device=device, dtype=dtype)
+        
+        # RoPE
+        rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len, device=device)
+
+        # MHA
+        self.attn = MultiheadSelfAttention(d_model=d_model, num_heads=num_heads, rope=rope, device=device, dtype=dtype)
+
+        # 第二层 RMSNorm
+        self.ln2 = Rmsnorm(d_model=d_model, device=device, dtype=dtype)
+
+        # SwiGLU FFN
+        self.ffn = SwiGLU(d_model_dim=d_model, d_ff_dim=d_ff, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        in_features: Float[Tensor, " batch sequence_length d_model"],
+    ) -> Float[Tensor, " batch sequence_length d_model"]:
+        # 构造 token_positions
+        seq_len = in_features.size(-2)
+        token_positions = torch.arange(seq_len, device=in_features.device)
+
+        # Pre-Norm + MHA + residual
+        attn_out = self.attn(self.ln1(in_features), token_positions)
+        re1 = in_features + attn_out
+
+        # Pre-Norm + FFN + residual
+        ffn_out = self.ffn(self.ln2(re1))
+        return re1 + ffn_out    
+    
+# TransformerLM
+# Token embedding -> Transformer Block * n -> Norm -> Linear -> softmax
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        device = None,
+        dtype = None
+    ):
+        super().__init__()
+
+        # Token embedding
+        self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
+
+        # Transformer Block * n
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, device, dtype)
+            for _ in range(num_layers)
+        ])
+
+        # Norm
+        self.ln_final = Rmsnorm(d_model=d_model, device=device, dtype=dtype)
+
+        # Linear
+        self.lm_head = Linear(d_model, vocab_size, device, dtype)
+    
+    def forward(
+        self,
+        in_indices: Int[Tensor, " batch_size sequence_length"],
+    ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
+        # Token embedding
+        output = self.token_embeddings(in_indices)
+
+        # Transformer Block * n
+        for layer in self.layers:
+            output = layer(output)
+
+        # Norm
+        output = self.ln_final(output)
+
+        # Linear
+        return self.lm_head(output)
