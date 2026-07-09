@@ -16,7 +16,7 @@ class Linear(nn.Module):
 
         # 初始化权重矩阵 Truncated Normal
         std = (2.0 / (in_features_dim + out_features_dim)) ** 0.5 # 初始化标准差
-        nn.init.trunc_normal_(self.weight, std=std, a=-2*std, b= -2*std)
+        nn.init.trunc_normal_(self.weight, std=std, a=-2*std, b= 2*std)
 
     def forward(
         self, 

@@ -1,6 +1,7 @@
 import regex as re
-from typing import Any
-from collections.abc import Iterable, Iterator 
+import json
+import base64
+from collections.abc import Iterable, Iterator
 
 class Tokenizer:
     def __init__(
@@ -49,23 +50,14 @@ class Tokenizer:
         # 读取vocab
         vocab: dict[int, bytes] = {}
         with open(vocab_filepath, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                # 去掉换行符号
-                token_bytes = line.rstrip("\n").encode("utf-8")
-                vocab[i] = token_bytes
+            raw = json.load(f)
+        vocab = {int(k): base64.b64decode(v) for k, v in raw.items()}
         
         # 读取megre
         merges: list[tuple[bytes, bytes]] = []
         with open(merges_filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("#"):
-                    continue
-                parts = line.split(" ")
-                if len(parts) != 2:
-                    continue
-                a, b = parts
-                merges.append((a.encode("utf-8"), b.encode("utf-8")))
+            raw = json.load(f)
+        merges = [(base64.b64decode(t1), base64.b64decode(t2)) for t1, t2 in raw]
         
         # 调用构造函数
         return cls(vocab, merges, special_tokens)
